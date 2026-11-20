@@ -13,6 +13,7 @@ Covers the required self-test matrix:
 """
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 from fastapi.testclient import TestClient
@@ -403,3 +404,295 @@ def test_withdrawal_marker_survives_across_connections(client):
         assert remaining == 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. Scale: many duplicate close rows and orphan closes must not blow up
+#    the query or exhaust memory. Only one row per page view is aggregated.
+# ---------------------------------------------------------------------------
+def _seed_duplicate_closes(db_path, visitor, page_views=200, closes_each=500):
+    """Write a large, deliberately messy event history directly to SQLite.
+
+    Every page view gets one open and ``closes_each`` duplicate closes
+    (retries / re-renders), plus a few thousand orphan closes for a page
+    view that was never opened. This is the shape that used to make the path
+    query load every row into Python and die with 500.
+    """
+    conn = connect(db_path)
+    try:
+        with write_transaction(conn):
+            for p in range(page_views):
+                pv = f"pv-{p:04d}"
+                base = f"2026-11-18T{8 + p // 60 % 12:02d}:{p % 60:02d}:00+00:00"
+                conn.execute(
+                    "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+                    (f"{pv}-o", visitor, pv, f"EX{p}", "open", base, base),
+                )
+                conn.executemany(
+                    "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+                    [
+                        (f"{pv}-c{i}", visitor, pv, f"EX{p}", "close",
+                         f"2026-11-18T{8 + p // 60 % 12:02d}:{p % 60:02d}:30+00:00",
+                         base)
+                        for i in range(closes_each)
+                    ],
+                )
+            conn.executemany(
+                "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+                [
+                    (f"orphan-{i}", visitor, "pv-orphan", "ORPH", "close",
+                     "2026-11-18T23:00:00+00:00", "2026-11-18T23:00:00+00:00")
+                    for i in range(5000)
+                ],
+            )
+    finally:
+        conn.close()
+
+
+def test_path_query_scales_with_visits_not_event_rows(client):
+    v = "visitor-huge"
+    _seed_duplicate_closes(config.DB_PATH, v)
+
+    path = client.get(f"/visitors/{v}/path").json()
+    assert path["total_visits"] == 200
+    assert [x["sequence"] for x in path["visits"]] == list(range(1, 201))
+    assert path["visits"][0]["page_view_id"] == "pv-0000"
+    # Earliest close wins even though it was reported 500 times.
+    assert path["visits"][0]["dwell_known"] is True
+    assert path["visits"][0]["dwell_seconds"] == 30.0
+    # Orphan closes (5000 of them, no open) still produce no visit.
+    assert all(x["page_view_id"] != "pv-orphan" for x in path["visits"])
+
+
+def test_path_query_does_not_fetch_raw_event_rows(client, monkeypatch):
+    # Scale guard: the aggregate runs in SQLite, so the per-query application
+    # footprint is one row per page view, independent of duplicate reports.
+    v = "visitor-traced"
+    _seed_duplicate_closes(config.DB_PATH, v, page_views=20, closes_each=50)
+
+    seen: list[tuple[int, str]] = []
+
+    class TracingCursor:
+        """Cursor proxy that records how many rows each fetchall returned."""
+
+        def __init__(self, inner, sql):
+            self._inner = inner
+            self._sql = " ".join(sql.split())
+
+        def fetchall(self):
+            rows = self._inner.fetchall()
+            seen.append((len(rows), self._sql))
+            return rows
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def __iter__(self):
+            return iter(self._inner)
+
+    class TracingConnection:
+        """Connection proxy so the real query runs unmodified."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def execute(self, sql, params=()):
+            return TracingCursor(self._inner.execute(sql, params), sql)
+
+    traced = TracingConnection(connect(config.DB_PATH))
+    try:
+        path = crud.get_visitor_path(traced, v)
+    finally:
+        traced._inner.close()
+
+    assert path.total_visits == 20
+    # Every SELECT fetched at most one row per page view (20), never the
+    # 1000 close rows written above. This is the regression guard for the
+    # out-of-memory / 500 failure on large reporters, including the orphan
+    # page view whose 5000 closes must not be materialised.
+    assert seen, "expected the traced connection to be used"
+    assert max(size for size, _ in seen) <= 20, seen
+    assert any("GROUP BY" in sql for _, sql in seen), seen
+
+
+# ---------------------------------------------------------------------------
+# 9. Legacy database: written by an older release, queried in place.
+# ---------------------------------------------------------------------------
+def test_legacy_database_is_queryable_and_upgraded(client, tmp_path):
+    v = "visitor-legacy"
+    db = tmp_path / "legacy.db"
+    # Simulate the pre-fix schema: no covering index, timestamps stored in
+    # the older "Z"-suffixed form, and duplicate closes present.
+    legacy = sqlite3.connect(db)
+    legacy.executescript(
+        """
+        CREATE TABLE events (
+            event_id TEXT NOT NULL PRIMARY KEY,
+            visitor_id TEXT NOT NULL,
+            page_view_id TEXT NOT NULL,
+            exhibit_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            received_at TEXT NOT NULL
+        );
+        CREATE TABLE withdrawals (
+            visitor_id TEXT NOT NULL PRIMARY KEY,
+            withdrawn_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_events_visitor_time ON events (visitor_id, event_time);
+        CREATE INDEX idx_events_visitor_page ON events (visitor_id, page_view_id);
+        """
+    )
+    legacy.executemany(
+        "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+        [
+            ("lo1", v, "pv1", "X", "open", "2026-11-18T08:00:00Z", "r"),
+            ("lc1", v, "pv1", "X", "close", "2026-11-18T08:05:00Z", "r"),
+            ("lc2", v, "pv1", "X", "close", "2026-11-18T08:06:00Z", "r"),
+            ("lo2", v, "pv2", "Y", "open", "2026-11-18T09:00:00Z", "r"),
+        ],
+    )
+    legacy.commit()
+    legacy.close()
+
+    # init_db() is what the container runs at startup: it must add the
+    # missing covering index to the old file without touching rows.
+    from app.db import init_db
+
+    init_db(str(db))
+
+    conn = connect(str(db))
+    try:
+        indexes = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'")}
+        # Index added for the new aggregation.
+        assert "idx_events_visitor_type_page_time" in indexes
+        # Rows untouched.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM events").fetchone()[0] == 4
+
+        path = crud.get_visitor_path(conn, v)
+        assert path.total_visits == 2
+        assert path.visits[0].opened_at == "2026-11-18T08:00:00Z"
+        assert path.visits[0].closed_at == "2026-11-18T08:05:00Z"
+        assert path.visits[0].dwell_seconds == 300.0
+        assert path.visits[1].dwell_known is False
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. Late backfill and withdrawal: the whole path comes from one committed
+#     snapshot, and a query after a successful withdrawal is empty.
+# ---------------------------------------------------------------------------
+def test_late_backfill_and_withdrawal_are_serialized_snapshots(client):
+    v = "visitor-interleave"
+    for pv, exhibit, opened in (
+        ("pv1", "X", "2026-11-18T08:00:00Z"),
+        ("pv2", "Y", "2026-11-18T09:00:00Z"),
+    ):
+        _post(client, event_id=f"{pv}-o", visitor=v, page_view=pv,
+              exhibit=exhibit, event_type="open", event_time=opened)
+
+    # A late backfill inserts an earlier visit and a missing close for the
+    # first one, atomically as a batch. Before it commits, a query must not
+    # see half of it; after it commits, the path is re-sorted by open time.
+    batch = {
+        "events": [
+            _event("pv0-o", v, "pv0", "Z", "open", "2026-11-18T07:00:00Z"),
+            _event("pv0-c", v, "pv0", "Z", "close", "2026-11-18T07:10:30Z"),
+            _event("pv1-c", v, "pv1", "X", "close", "2026-11-18T08:02:00Z"),
+        ]
+    }
+    assert client.post("/events/batch", json=batch).status_code == 201
+
+    path = client.get(f"/visitors/{v}/path").json()
+    assert [x["exhibit_id"] for x in path["visits"]] == ["Z", "X", "Y"]
+    assert [x["sequence"] for x in path["visits"]] == [1, 2, 3]
+    assert path["visits"][0]["dwell_seconds"] == 630.0
+    assert path["visits"][1]["dwell_seconds"] == 120.0
+    assert path["visits"][2]["dwell_known"] is False
+
+    # Withdraw and immediately query on a fresh connection: no half-erased
+    # path, and the post-withdrawal result is empty.
+    w = client.post(f"/visitors/{v}/withdraw", json={"visitor_id": v})
+    assert w.status_code == 200 and w.json()["already_withdrawn"] is False
+    after = client.get(f"/visitors/{v}/path").json()
+    assert after == {
+        "visitor_id": v,
+        "consent_withdrawn": True,
+        "visits": [],
+        "total_visits": 0,
+    }
+
+
+def test_reader_snapshot_is_stable_while_writer_commits(client, monkeypatch):
+    # Directly exercise the snapshot boundary: a withdrawal committed between
+    # the consent check and the aggregation must not leak an empty-but-not-
+    # withdrawn or half-erased path into one response.
+    v = "visitor-snapshot"
+    _post(client, event_id="s1", visitor=v, page_view="pv1",
+          exhibit="X", event_type="open", event_time="2026-11-18T08:00:00Z")
+    _post(client, event_id="s2", visitor=v, page_view="pv1",
+          exhibit="X", event_type="close", event_time="2026-11-18T08:05:00Z")
+
+    reader = connect(config.DB_PATH)
+    writer = connect(config.DB_PATH)
+    try:
+        real_is_withdrawn = crud.is_withdrawn
+        injected = {"done": False}
+
+        def is_withdrawn_then_race(conn, visitor_id):
+            result = real_is_withdrawn(conn, visitor_id)
+            if not injected["done"]:
+                injected["done"] = True
+                # Commit a withdrawal on another connection *after* this
+                # snapshot's first read. The reader's transaction must keep
+                # returning the complete pre-withdrawal path.
+                with write_transaction(writer):
+                    crud.withdraw_consent(writer, visitor_id)
+            return result
+
+        monkeypatch.setattr(crud, "is_withdrawn", is_withdrawn_then_race)
+        path = crud.get_visitor_path(reader, v)
+        monkeypatch.undo()
+
+        assert path.consent_withdrawn is False
+        assert path.total_visits == 1
+        assert path.visits[0].closed_at == "2026-11-18T08:05:00+00:00"
+
+        # Subsequent queries see the committed withdrawal: empty path.
+        after = crud.get_visitor_path(reader, v)
+        assert after.consent_withdrawn is True and after.visits == []
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_late_open_backfills_orphan_close_into_a_visit(client):
+    v = "visitor-late-open"
+    # The close is reported first and, until its open arrives, is an orphan
+    # that produces no visit.
+    _post(client, event_id="lo-c2", visitor=v, page_view="pv2",
+          exhibit="Y", event_type="close", event_time="2026-11-18T09:02:00Z")
+    path = client.get(f"/visitors/{v}/path").json()
+    assert path["total_visits"] == 0
+
+    # A complete visit already exists for a later page view.
+    _post(client, event_id="lo-o3", visitor=v, page_view="pv3",
+          exhibit="Z", event_type="open", event_time="2026-11-18T10:00:00Z")
+    _post(client, event_id="lo-c3", visitor=v, page_view="pv3",
+          exhibit="Z", event_type="close", event_time="2026-11-18T10:01:00Z")
+
+    # The missing earlier open is backfilled late: the orphan close becomes a
+    # full visit, ordered before the existing one, with its dwell computed.
+    _post(client, event_id="lo-o2", visitor=v, page_view="pv2",
+          exhibit="Y", event_type="open", event_time="2026-11-18T09:00:00Z")
+    path = client.get(f"/visitors/{v}/path").json()
+    assert [x["exhibit_id"] for x in path["visits"]] == ["Y", "Z"]
+    assert [x["sequence"] for x in path["visits"]] == [1, 2]
+    assert path["visits"][0]["dwell_seconds"] == 120.0
+    assert path["visits"][0]["dwell_known"] is True

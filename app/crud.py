@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
+from .db import snapshot_transaction
 from .models import (
     EventIn,
     IngestResult,
@@ -29,8 +30,11 @@ def utc_now_iso() -> str:
 def parse_utc(value: str) -> datetime:
     """Parse an ISO-8601 timestamp and normalize it to UTC.
 
-    Naive timestamps are rejected: the API contract requires explicit UTC
-    so that open/close durations are never computed on ambiguous local time.
+    Accepts the shapes that end up stored in the database (``+00:00``) and
+    the ones clients send (``Z``, offsets, fractional seconds). The result
+    round-trips through :meth:`datetime.isoformat`, so re-parsing a stored
+    value — e.g. a very old SQLite row written by an earlier release —
+    always succeeds.
     """
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -90,28 +94,62 @@ def ingest_event(conn: sqlite3.Connection, event: EventIn) -> IngestResult:
     return IngestResult(event_id=event.event_id, status="stored")
 
 
-def _pair_visits(rows: list[sqlite3.Row]) -> list[Visit]:
-    """Pair open/close rows by page_view_id and order the resulting path."""
-    opens: dict[str, sqlite3.Row] = {}
-    closes: dict[str, list[sqlite3.Row]] = {}
+# Path aggregation runs inside SQLite with GROUP BY + MIN, so only one row
+# per page view crosses into the application (never one row per event).
+# A visitor can accumulate tens of thousands of duplicate close rows for a
+# single page view; loading those into Python is what used to exhaust
+# memory and surface as HTTP 500. SQLite streams the aggregate through the
+# covering index idx_events_visitor_type_page_time instead, so application
+# memory grows with the number of visits, not with the number of reports.
+#
+# Earliest open and earliest close per page view are two grouped queries
+# (rather than a self-join) because a page view may report several opens
+# and closes; the grouped MIN keeps exactly the same "earliest wins"
+# pairing semantics as before, including close-before-open anomalies.
+_OPEN_ROWS_SQL = """
+    SELECT page_view_id,
+           MIN(event_time) AS opened_at,
+           exhibit_id
+    FROM events
+    WHERE visitor_id = ? AND event_type = 'open'
+    GROUP BY page_view_id
+"""
 
-    for row in rows:
-        bucket = opens if row["event_type"] == "open" else closes
-        if row["event_type"] == "open":
-            # Keep the earliest open if a page view ever reports more than one.
-            if row["page_view_id"] not in bucket or row["event_time"] < bucket[row["page_view_id"]]["event_time"]:
-                bucket[row["page_view_id"]] = row
-        else:
-            closes.setdefault(row["page_view_id"], []).append(row)
+# Closes are restricted to page views that actually have an open before
+# aggregating. A visitor can have far more orphan closes (no matching open)
+# than real visits, and aggregating those would materialise one row per
+# orphan page view even though none can become a visit. The IN subquery is
+# evaluated once from the same covering index and is bounded by the visit
+# count; SQLite then seeks only the matching page views for the MIN.
+_CLOSE_ROWS_SQL = """
+    SELECT page_view_id,
+           MIN(event_time) AS closed_at
+    FROM events
+    WHERE visitor_id = ? AND event_type = 'close'
+      AND page_view_id IN (
+          SELECT page_view_id
+          FROM events
+          WHERE visitor_id = ? AND event_type = 'open'
+      )
+    GROUP BY page_view_id
+"""
+
+
+def _pair_visits(opens: list[sqlite3.Row], closes: list[sqlite3.Row]) -> list[Visit]:
+    """Combine per-page-view earliest open/close rows into the ordered path.
+
+    ``opens`` and ``closes`` each hold at most one row per page view, so the
+    dictionaries built here are bounded by the visitor's visit count.
+    """
+    closes_by_page = {row["page_view_id"]: row["closed_at"] for row in closes}
 
     visits: list[Visit] = []
-    for page_view_id, open_row in opens.items():
-        opened_at = open_row["event_time"]
-        close_rows = closes.get(page_view_id, [])
-        # Earliest close for this page view.
-        close_row = min(close_rows, key=lambda r: r["event_time"]) if close_rows else None
-
-        closed_at = close_row["event_time"] if close_row is not None else None
+    for open_row in opens:
+        page_view_id = open_row["page_view_id"]
+        opened_at = open_row["opened_at"]
+        # A close without a matching open never reaches this loop, so orphan
+        # closes still do not produce a visit.
+        closed_at = closes_by_page.get(page_view_id)
         dwell_seconds: float | None = None
         dwell_known = False
 
@@ -148,15 +186,14 @@ def _pair_visits(rows: list[sqlite3.Row]) -> list[Visit]:
 def get_visitor_path(conn: sqlite3.Connection, visitor_id: str) -> VisitPath:
     """Reconstruct a visitor's path from committed events.
 
-    Runs in a single read transaction so the withdrawal check and the event
-    scan observe one consistent snapshot.
+    Runs in a single read snapshot transaction so the withdrawal check and
+    both aggregation queries observe one consistent committed state: a
+    withdrawal committing concurrently can never yield a half-erased path.
     """
-    conn.execute("BEGIN DEFERRED")
-    try:
+    with snapshot_transaction(conn):
         withdrawn = is_withdrawn(conn, visitor_id)
         if withdrawn:
             # Consent withdrawn: the path must disappear and stay empty.
-            conn.rollback()
             return VisitPath(
                 visitor_id=visitor_id,
                 consent_withdrawn=True,
@@ -164,25 +201,17 @@ def get_visitor_path(conn: sqlite3.Connection, visitor_id: str) -> VisitPath:
                 total_visits=0,
             )
 
-        rows = conn.execute(
-            """
-            SELECT page_view_id, exhibit_id, event_type, event_time
-            FROM events
-            WHERE visitor_id = ?
-            """,
-            (visitor_id,),
+        opens = conn.execute(_OPEN_ROWS_SQL, (visitor_id,)).fetchall()
+        closes = conn.execute(
+            _CLOSE_ROWS_SQL, (visitor_id, visitor_id)
         ).fetchall()
-        visits = _pair_visits(rows)
-        conn.rollback()  # read-only snapshot; nothing to commit
+        visits = _pair_visits(opens, closes)
         return VisitPath(
             visitor_id=visitor_id,
             consent_withdrawn=False,
             visits=visits,
             total_visits=len(visits),
         )
-    except Exception:
-        conn.rollback()
-        raise
 
 
 def withdraw_consent(conn: sqlite3.Connection, visitor_id: str) -> WithdrawResult:

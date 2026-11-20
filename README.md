@@ -68,14 +68,30 @@ HTTP 状态码：成功受理固定 `201`，具体结果看响应体 `status`；
 3. **撤回后不可恢复**：`withdrawals` 表持久化撤回标记；撤回在一个 `BEGIN IMMEDIATE`
    事务内完成「删除该观众全部事件 + 写撤回标记」。此后任何上传（包括旧事件重放）
    在同一事务内先查撤回标记，一律 `rejected_withdrawn`。
-4. **交错操作基于同一已提交状态、不露半份路径**：
+4. **查询内存随参观项数增长，不随上报条数增长（本次修复）**：
+   - 旧实现把该观众的全部事件行 `fetchall()` 进 Python 再配对；有的观众只看过
+     一件展品却因重传/重复上报积攒了大量重复关页或找不到开页的孤儿关页，查询时
+     内存暴涨直至 OOM，表现为 `500`。
+   - 现在「每个 `page_view_id` 取最早 open、最早 close」的聚合直接下推到 SQLite
+     （`GROUP BY page_view_id` + `MIN(event_time)`），只把每个浏览号一行带回应用；
+     配对语义与旧实现完全一致（最早 open、最早 close、孤儿 close 不成参观项、
+     close 早于 open 标记停留未知）。
+   - 新增覆盖索引 `(visitor_id, event_type, page_view_id, event_time)`，聚合可按
+     索引流式完成；close 聚合先用 `IN (仅该观众有 open 的浏览号)` 收窄，孤儿关页
+     再多也不会被逐行物化。
+   - `init_db()` 使用 `IF NOT EXISTS` 语句逐条执行，**旧 SQLite 库无需迁移脚本、
+     直接可查**，首次启动自动补上缺失索引，已有事件行保持不变；
+     旧库中 `...Z` / `...+0000` 形式的时间戳也能正常解析。
+5. **交错操作基于同一已提交状态、不露半份路径**：
    - SQLite 开 WAL，写请求统一 `BEGIN IMMEDIATE` 立即拿写锁，配合 `busy_timeout`
      串行化所有写事务；
-   - 读请求在单个 `BEGIN DEFERRED` 快照事务里完成「撤回检查 + 事件扫描」，
-     要么看到撤回前的完整状态，要么看到撤回后的空路径；
+   - 读请求在单个 `BEGIN DEFERRED` 快照事务里完成「撤回检查 + open 聚合 +
+     close 聚合」，三条语句看到同一份已提交状态：要么是撤回前的完整路径，要么是
+     撤回后的空路径，不会出现“撤回检查通过、聚合却读到已删除数据”的半份结果；
    - 路径是查询时推导的，不存在“路径表更新一半”的中间态；
-   - 批量上报为单事务，任一事件非法则整批回滚。
-5. **线程/进程并发**：每请求一个独立 SQLite 连接（`check_same_thread=False`
+   - 批量上报为单事务，任一事件非法则整批回滚；迟到补报（更早的 open、缺失的
+     close）提交后，下次查询按 open 时间重新排序并重算停留时长。
+6. **线程/进程并发**：每请求一个独立 SQLite 连接（`check_same_thread=False`
    以适配 uvicorn 线程池，连接不在请求间共享）；多个 uvicorn worker 共享同一
    数据卷时由 SQLite 文件锁保证安全。
 
@@ -90,7 +106,7 @@ app/
   main.py      FastAPI 路由与生命周期
 tests/
   conftest.py
-  test_api.py      15 项功能/并发测试
+  test_api.py      21 项功能/并发/规模/旧库测试
   stress_http.py   针对运行中服务的真实 HTTP 并发压测（手动运行）
 Dockerfile
 docker-compose.yml
@@ -107,13 +123,31 @@ pytest tests/ -v
 缺关闭标记未知及补关后转已知、孤儿 close、`event_id` 重传（含篡改内容）、
 批量去重与整批原子回滚、撤回后路径消失/重复撤回幂等/旧事件重放与新事件均被拒、
 多线程上传-查询-撤回交错（进程内 TestClient 与真实 HTTP 两种）、
-无时区时间拒绝、时区偏移归一化、负停留异常、WAL 与主键的存储层校验。
+无时区时间拒绝、时区偏移归一化、负停留异常、WAL 与主键的存储层校验，
+以及本次修复的回归测试：
+
+- `test_path_query_scales_with_visits_not_event_rows`：200 个浏览号各 500 条
+  重复 close，再加 5000 条孤儿 close，查询仍返回 200 项且停留时长正确；
+- `test_path_query_does_not_fetch_raw_event_rows`：代理连接记录每次 `fetchall`
+  的行数，断言任何一次查询抓取的行数都不超过浏览号数量（而不是事件条数）；
+- `test_legacy_database_is_queryable_and_upgraded`：构造旧版 schema/旧时间戳格式
+  的库，`init_db` 后直接查询成功、补上索引且事件行不变；
+- `test_late_open_backfills_orphan_close_into_a_visit`：只到 close 的孤儿先不
+  产生参观项，迟到补上更早的 open 后成为完整参观并正确排序；
+- `test_late_backfill_and_withdrawal_are_serialized_snapshots` 与
+  `test_reader_snapshot_is_stable_while_writer_commits`：迟到补报按原规则重排并
+  重算停留；读快照期间另一连接提交撤回，本次查询仍返回完整旧路径，之后的查询
+  返回空路径。
 
 ## 已知限制 / 未完成项
 
-- 本开发沙箱没有 Docker 守护进程，`Dockerfile` 与 `docker-compose.yml` 已编写并做
-  YAML/结构校验，但**未在真实 Docker 中构建运行**；容器外已用 uvicorn 单进程与
-  `--workers 2` 两种方式完成功能与并发验证。
+- 本开发沙箱没有 Docker 守护进程（`docker` / `podman` 均不可用），
+  `Dockerfile` 与 `docker-compose.yml` 已编写并做 YAML/结构校验，但**未在真实
+  Docker 中构建运行**；等价验证是在容器外以 `uvicorn app.main:app` 单进程、
+  `EXHIBITION_DB` 指向与容器相同的 SQLite 文件完成的（含 `/docs` 与全部 API）。
+- 旧库首次启动时若缺少覆盖索引，`init_db()` 会建索引：实测 80 万事件行约 5 秒，
+  属于一次性成本；数据量更大时建议在维护窗口预建或手工执行同名
+  `CREATE INDEX IF NOT EXISTS`。
 - 同一 `page_view_id` 若出现多个 open，取最早 open；多个 close 取最早 close，
   异常上报不报错但只保留一组配对。
 - 没有鉴权/限流与分页；观众号、事件号均按字符串处理，未做格式白名单。
